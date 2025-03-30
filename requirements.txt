@@ -1,0 +1,5 @@
+playwright>=1.40.0
+jsbeautifier>=1.14.9
+mitmproxy>=10.2.2
+aiohttp>=3.9.1
+typing-extensions>=4.8.0
