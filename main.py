@@ -163,8 +163,9 @@ class BugBountyScanner:
             # 2️⃣ Configurar y ejecutar el analizador avanzado de JS
             print("2. Ejecutando análisis avanzado de JavaScript...")
             await self.advanced_js_analyzer.setup_debugger(self.page)
-            js_advanced_analysis = await self.advanced_js_analyzer.run_full_analysis(self.page)
-            self.report_generator.add_findings("Advanced JS Analysis", js_advanced_analysis["findings"])
+            analyzer = AdvancedJSAnalyzer()
+            results = await analyzer.run_analysis_with_retry(self.page)
+            self.report_generator.add_findings("Advanced JS Analysis", results["findings"])
             
             # 3️⃣ Extraer y analizar JavaScript tradicional
             print("3. Analizando JavaScript...")
