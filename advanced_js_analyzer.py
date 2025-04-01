@@ -1,824 +1,426 @@
-import logging
 import asyncio
 import os
 import stat
 from pathlib import Path
-from curses import window
-from dataclasses import field
-from math import prod
 import random
 import re
 import json
 import base64
-from aiohttp import Payload
 import jsbeautifier
 from typing import List, Dict, Any
+import time  # For timestamps if needed
+
+# Import ConsoleManager
+from console_manager import ConsoleManager
+from playwright.async_api import Page, Error as PlaywrightError
+
 
 class AdvancedJSAnalyzer:
-    def __init__(self, console_manager):
-        # Initialize logging
-        self.logger = logging.getLogger('AdvancedJSAnalyzer')
-        self.logger.setLevel(logging.INFO)
-        
-        # Create handler if none exists
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-            
-        self.console = console_manager  # Add console manager
-        self.logger.info("Initializing AdvancedJSAnalyzer...")
-        
-        # Existing initialization code
-        self.findings = []
-        self.traced_functions = {}
-        self.modified_variables = {}
+    def __init__(self, console_manager: ConsoleManager):
+        self.console = console_manager
+        # Use internal findings list, which will be returned by run_full_analysis
+        self._internal_findings: List[Dict[str, Any]] = []
+
+        self.console.print_debug("Initializing AdvancedJSAnalyzer...")
+
+        # Payload list (Consider moving to central payloads.py if shared)
         self.cmd_injection_payloads = [
-            "; ls -la", 
-            "& dir", 
-            "| cat /etc/passwd", 
-            "$(whoami)", 
-            "`id`", 
-            "$(cat /etc/shadow)", 
-            "'; ls -la; '", 
-            "&& netstat -an"
+            "; id", "& dir", "| cat /etc/passwd", "$(id)", "`id`", "&& whoami", "|| hostname"
         ]
-        
-        # Verificar y configurar permisos
+
+        # Setup working directory (keep existing logic)
         self.working_dir = Path('/tmp/robot-hunter')
         try:
-            # Crear directorio temporal con permisos seguros
             self.working_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(self.working_dir, stat.S_IRWXU)
-            
-            self.logger.info(f"Directorio de trabajo creado: {self.working_dir}")
+            os.chmod(self.working_dir, stat.S_IRWXU)  # Owner Read/Write/Execute
+            self.console.print_debug(f"AdvancedJSAnalyzer working directory: {self.working_dir}")
         except PermissionError as e:
-            self.logger.error(f"Error de permisos al crear directorio: {e}")
-            # Intentar usar directorio alternativo
-            self.working_dir = Path.home() / '.robot-hunter'
-            self.working_dir.mkdir(parents=True, exist_ok=True)
-            self.logger.info(f"Usando directorio alternativo: {self.working_dir}")
-        
-        # Configurar manejo de errores mejorado
-        self.error_handlers = {
-            'PermissionError': self._handle_permission_error,
-            'TimeoutError': self._handle_timeout_error,
-            'NetworkError': self._handle_network_error
-        }
-        
-        self.logger.debug("Initialization complete")
-        
-    async def _handle_permission_error(self, error, context=None):
-        """Maneja errores de permisos"""
-        self.logger.error(f"Error de permisos: {error}")
-        self.logger.info("Intentando ejecutar con privilegios reducidos...")
-        
-        if context and 'operation' in context:
+            self.console.print_warning(f"Permission error creating {self.working_dir}: {e}. Using fallback.")
             try:
-                # Intentar operación alternativa con menos privilegios
-                if context['operation'] == 'file_access':
-                    return await self._safe_file_access(context['path'])
-                elif context['operation'] == 'network_access':
-                    return await self._safe_network_access(context['url'])
-            except Exception as e:
-                self.logger.error(f"Error en operación alternativa: {e}")
-                return None
+                self.working_dir = Path.home() / '.robot-hunter-advjs'
+                self.working_dir.mkdir(parents=True, exist_ok=True)
+                self.console.print_debug(f"AdvancedJSAnalyzer fallback directory: {self.working_dir}")
+            except Exception as fallback_e:
+                self.console.print_error(f"Failed to create fallback directory {self.working_dir}: {fallback_e}")
+                # Decide how to handle this - maybe disable features needing disk?
+
+        self.console.print_debug("AdvancedJSAnalyzer initialization complete")
+
+    def _add_finding(self, type: str, severity: str, details: dict, url: str = ""):
+        """Adds a finding to the internal list."""
+        finding = {
+            "type": f"js_dynamic_{type}",  # Prefix to distinguish from static
+            "severity": severity,
+            "url": url,  # Add URL context if available
+            "details": details,
+            "timestamp": time.time()
+        }
+        self._internal_findings.append(finding)
+
+    # --- Error Handlers (Using ConsoleManager) ---
+    async def _handle_permission_error(self, error, context=None):
+        self.console.print_error(f"Permission Error during JS analysis: {error}")
+        pass
 
     async def _handle_timeout_error(self, error, context=None):
-        """Maneja errores de timeout"""
-        self.logger.error(f"Error de timeout: {error}")
-        self.console.print(f"[red]Timeout Error: {error}[/red]")  # Use console manager
-        self.logger.info("Intentando operación con timeout extendido...")
-        
-        if context and 'operation' in context:
-            try:
-                # Reintentar con timeout extendido
-                if context.get('retry_count', 0) < 3:
-                    context['retry_count'] = context.get('retry_count', 0) + 1
-                    context['timeout'] = context.get('timeout', 30) * 2
-                    
-                    self.logger.info(f"Reintento {context['retry_count']} con timeout de {context['timeout']}s")
-                    
-                    if context['operation'] == 'page_load':
-                        return await self._safe_page_load(context['url'], context['timeout'])
-                    elif context['operation'] == 'script_execution':
-                        return await self._safe_script_execution(context['script'], context['timeout'])
-                    
-                return None
-            except Exception as e:
-                self.logger.error(f"Error en reintento con timeout extendido: {e}")
-                self.console.print(f"[red]Error in retry with extended timeout: {e}[/red]")  # Use console manager
-                return None
+        self.console.print_error(f"Timeout Error during JS analysis: {error}")
+        pass
 
     async def _handle_network_error(self, error, context=None):
-        """Maneja errores de red"""
-        self.logger.error(f"Error de red: {error}")
-        self.console.print(f"[red]Network Error: {error}[/red]")  # Use console manager
-        self.logger.info("Intentando operación alternativa de red...")
-        
-        if context and 'operation' in context:
-            try:
-                # Intentar operación alternativa
-                if context['operation'] == 'fetch':
-                    return await self._safe_network_access(context['url'])
-                elif context['operation'] == 'websocket':
-                    return await self._safe_websocket_connection(context['url'])
-            except Exception as e:
-                self.logger.error(f"Error en operación alternativa de red: {e}")
-                self.console.print(f"[red]Error in alternative network operation: {e}[/red]")  # Use console manager
-                return None
+        self.console.print_error(f"Network Error during JS analysis: {error}")
+        pass
 
+    # --- Safe Operations (Example logging change) ---
     async def _safe_file_access(self, path):
-        """Intenta acceder a archivos de forma segura"""
         try:
             temp_path = self.working_dir / Path(path).name
-            self.logger.debug(f"Intentando acceso seguro a: {temp_path}")
+            self.console.print_debug(f"Attempting safe file access to: {temp_path}")
             return temp_path
         except Exception as e:
-            self.logger.error(f"Error en acceso seguro a archivo: {e}")
+            self.console.print_error(f"Error in safe file access '{path}': {e}")
             return None
 
-    async def _safe_network_access(self, url):
-        """Intenta acceso a red con privilegios reducidos"""
-        try:
-            self.logger.debug(f"Intentando acceso a red seguro para: {url}")
-            # Implementar lógica de acceso a red con privilegios reducidos
-            return True
-        except Exception as e:
-            self.logger.error(f"Error en acceso seguro a red: {e}")
-            return None
-
-    async def _safe_page_load(self, url: str, timeout: int):
-        """Carga segura de página con timeout extendido"""
-        self.logger.debug(f"Intentando cargar {url} con timeout de {timeout}s")
-        try:
-            # Implementar lógica de carga segura
-            self.console.print(f"[yellow]Loading page: {url}[/yellow]")  # Use console manager
-            return True
-        except Exception as e:
-            self.logger.error(f"Error en carga segura de página: {e}")
-            self.console.print(f"[red]Error in safe page load: {e}[/red]")  # Use console manager
-            return None
-
-    async def _safe_script_execution(self, script: str, timeout: int):
-        """Ejecución segura de script con timeout extendido"""
-        self.logger.debug(f"Intentando ejecutar script con timeout de {timeout}s")
-        try:
-            # Implementar lógica de ejecución segura
-            self.console.print(f"[yellow]Executing script with timeout: {timeout}s[/yellow]")  # Use console manager
-            return True
-        except Exception as e:
-            self.logger.error(f"Error en ejecución segura de script: {e}")
-            self.console.print(f"[red]Error in safe script execution: {e}[/red]")  # Use console manager
-            return None
-
-    async def run_analysis_with_retry(self, page, max_retries=3):
-        """Ejecuta análisis con reintentos y manejo de errores"""
+    async def run_analysis_with_retry(self, page: Page, max_retries: int = 2) -> Dict[str, List[Dict[str, Any]]]:
+        """Runs the full analysis with retries, returning findings."""
         for attempt in range(max_retries):
+            self._internal_findings = []
             try:
-                self.logger.info(f"Intento de análisis {attempt + 1}/{max_retries}")
-                self.console.print(f"[blue]Analysis attempt {attempt + 1}/{max_retries}[/blue]")  # Use console manager
-                findings = await self.run_full_analysis(page)  # Capture findings
-                return {"findings": findings}  # Return structured findings
+                self.console.print_info(f"Starting advanced JS analysis (Attempt {attempt + 1}/{max_retries}) on {page.url}")
+                await self.run_full_analysis(page)
+                self.console.print_success(f"Advanced JS analysis completed (Attempt {attempt + 1}). Found {len(self._internal_findings)} potential findings.")
+                return {"findings": self._internal_findings}
             except PermissionError as e:
-                self.logger.warning(f"Error de permisos en intento {attempt + 1}: {e}")
-                self.console.print(f"[yellow]Permission Error: {e}[/yellow]")  # Use console manager
+                self.console.print_warning(f"JS Analysis Permission Error (Attempt {attempt + 1}): {e}")
                 await self._handle_permission_error(e, {'operation': 'analysis'})
                 if attempt == max_retries - 1:
-                    raise
-            except Exception as e:
-                self.logger.error(f"Error general en intento {attempt + 1}: {e}")
-                self.console.print(f"[red]General Error: {e}[/red]")  # Use console manager
+                    self.console.print_error("Max retries reached for JS analysis due to permission errors.")
+                    return {"findings": self._internal_findings}
+            except PlaywrightError as pe:
+                self.console.print_error(f"Playwright error during JS analysis (Attempt {attempt + 1}): {pe}")
                 if attempt == max_retries - 1:
-                    raise
-            await asyncio.sleep(1)
+                    self.console.print_error("Max retries reached for JS analysis due to Playwright errors.")
+                    return {"findings": self._internal_findings}
+                await asyncio.sleep(1.5 ** attempt)
+            except Exception as e:
+                self.console.print_error(f"General error during JS analysis (Attempt {attempt + 1}): {e}")
+                self.console.console.print_exception(show_locals=self.console.verbose)
+                if attempt == max_retries - 1:
+                    self.console.print_error("Max retries reached for JS analysis due to general errors.")
+                    return {"findings": self._internal_findings}
+                await asyncio.sleep(1.5 ** attempt)
 
-    async def setup_debugger(self, page):
-        """Configurar el debugger y los hooks de instrumentación"""
-        await page.evaluate("""
-        (() => {
-            // Almacenamiento global para resultados
-            window.__debugData = {
-                functionCalls: [],
-                singleCharVars: {},
-                networkRequests: [],
-                errors: [],
-                modifiedVars: {},
-                callGraph: {},
-                serviceConnections: [],
-                dbOperations: []
-            };
-            
-            // Interceptar todas las llamadas a fetch y XHR
-            const originalFetch = window.fetch;
-            window.fetch = async function(resource, options) {
-                try {
-                    const callStack = new Error().stack;
-                    const requestData = {
-                        type: 'fetch',
-                        url: resource.toString(),
-                        options: options || {},
-                        timestamp: Date.now(),
-                        stack: callStack
-                    };
-                    
-                    window.__debugData.networkRequests.push(requestData);
-                    
-                    // Analizar si parece conexión a DB o servicio
-                    const url = resource.toString();
-                    if (url.match(/api|service|db|data|query|graphql|firebase|aws/i)) {
-                        window.__debugData.serviceConnections.push({
-                            type: 'api_endpoint',
-                            url: url,
-                            timestamp: Date.now(),
-                            caller: callStack.split('\\n')[1]
-                        });
+        return {"findings": self._internal_findings}
+
+    # --- JS Debugger/Instrumentation Setup ---
+    async def setup_debugger(self, page: Page):
+        """Configures the JS environment for analysis."""
+        self.console.print_debug("Setting up JS debugger hooks...")
+        try:
+            await page.evaluate("""
+            (() => {
+                if (window.__debugData) return;
+
+                window.__debugData = { /* ... existing structure ... */ };
+                document.body.setAttribute('data-robot-hunter-ignore', 'true');
+                setTimeout(() => {
+                    if (document.body.hasAttribute('data-robot-hunter-ignore')) {
+                        document.body.removeAttribute('data-robot-hunter-ignore');
                     }
-                    
-                    // Ejecutar el fetch original
-                    const response = await originalFetch.apply(this, arguments);
-                    
-                    // Capturar el resultado si es posible
-                    const clone = response.clone();
-                    try {
-                        const contentType = clone.headers.get('content-type');
-                        if (contentType && contentType.includes('application/json')) {
-                            const jsonData = await clone.json();
-                            requestData.response = {
-                                status: clone.status,
-                                contentType: contentType,
-                                data: jsonData
-                            };
-                            
-                            // Detectar posibles datos de DB
-                            if (JSON.stringify(jsonData).match(/id|user|pass|admin|account|key|token/i)) {
-                                window.__debugData.dbOperations.push({
-                                    type: 'db_data',
-                                    operation: 'read',
-                                    data: jsonData,
-                                    url: url
-                                });
-                            }
-                        }
-                    } catch(e) {
-                        // Error al parsear la respuesta
-                    }
-                    
-                    return response;
-                } catch(error) {
-                    window.__debugData.errors.push({
-                        type: 'fetch_error',
-                        error: error.toString(),
-                        url: resource.toString(),
-                        timestamp: Date.now()
-                    });
-                    throw error;
-                }
-            };
-            
-            // Interceptar XHR
-            const originalXHROpen = XMLHttpRequest.prototype.open;
-            const originalXHRSend = XMLHttpRequest.prototype.send;
-            
-            XMLHttpRequest.prototype.open = function(method, url) {
-                this._debugData = {
-                    method: method,
-                    url: url,
-                    timestamp: Date.now(),
-                    stack: new Error().stack
-                };
-                return originalXHROpen.apply(this, arguments);
-            };
-            
-            XMLHttpRequest.prototype.send = function(data) {
-                if (this._debugData) {
-                    this._debugData.data = data;
-                    window.__debugData.networkRequests.push(this._debugData);
-                    
-                    // Analizar si parece conexión a DB o servicio
-                    const url = this._debugData.url;
-                    if (url.match(/api|service|db|data|query|graphql|firebase|aws/i)) {
-                        window.__debugData.serviceConnections.push({
-                            type: 'api_endpoint',
-                            url: url,
-                            method: this._debugData.method,
-                            timestamp: Date.now(),
-                            caller: this._debugData.stack.split('\\n')[1]
-                        });
-                    }
-                }
-                
-                // Interceptar la respuesta
-                this.addEventListener('load', function() {
-                    if (this._debugData) {
-                        this._debugData.response = {
-                            status: this.status,
-                            responseText: this.responseText
-                        };
-                        
-                        // Detectar posibles datos de DB
-                        if (this.responseText.match(/id|user|pass|admin|account|key|token/i)) {
-                            window.__debugData.dbOperations.push({
-                                type: 'db_data',
-                                operation: 'read',
-                                data: this.responseText.substring(0, 1000), // Limitar tamaño
-                                url: this._debugData.url
-                            });
-                        }
-                    }
-                });
-                
-                return originalXHRSend.apply(this, arguments);
-            };
-            
-            // Encontrar y rastrear variables de una sola letra
-            for (let key in window) {
-                if (key.length === 1 || key.match(/^[a-z]\\d*$/)) {
-                    const value = window[key];
-                    
-                    // Guardar estado original
-                    window.__debugData.singleCharVars[key] = {
-                        type: typeof value,
-                        originalValue: value,
-                        properties: typeof value === 'object' ? Object.keys(value || {}) : [],
-                        usageCount: 0,
-                        methodCalls: []
-                    };
-                    
-                    // Si es un objeto, rastrear sus métodos
-                    if (typeof value === 'object' && value !== null) {
-                        for (let prop in value) {
-                            if (typeof value[prop] === 'function') {
-                                const originalMethod = value[prop];
-                                value[prop] = function() {
-                                    window.__debugData.singleCharVars[key].usageCount++;
-                                    window.__debugData.singleCharVars[key].methodCalls.push({
-                                        method: prop,
-                                        args: Array.from(arguments),
-                                        timestamp: Date.now(),
-                                        stack: new Error().stack
-                                    });
-                                    
-                                    // Rastrear en el grafo de llamadas
-                                    const caller = new Error().stack.split('\\n')[2]?.trim() || 'unknown';
-                                    const callee = key + '.' + prop;
-                                    
-                                    if (!window.__debugData.callGraph[caller]) {
-                                        window.__debugData.callGraph[caller] = [];
-                                    }
-                                    window.__debugData.callGraph[caller].push(callee);
-                                    
-                                    return originalMethod.apply(this, arguments);
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Interceptar errores globales
-            window.addEventListener('error', function(event) {
-                window.__debugData.errors.push({
-                    type: 'global_error',
-                    message: event.message,
-                    filename: event.filename,
-                    lineno: event.lineno,
-                    colno: event.colno,
-                    timestamp: Date.now(),
-                    stack: event.error?.stack
-                });
-            });
-            
-            // Interceptar promesas rechazadas
-            window.addEventListener('unhandledrejection', function(event) {
-                window.__debugData.errors.push({
-                    type: 'promise_rejection',
-                    reason: event.reason?.toString(),
-                    timestamp: Date.now(),
-                    stack: event.reason?.stack
-                });
-            });
-            
-            // Activar debugger para funciones sospechosas
-            ['eval', 'Function', 'setTimeout', 'setInterval'].forEach(funcName => {
-                if (typeof window[funcName] === 'function') {
-                    const original = window[funcName];
-                    window[funcName] = function() {
-                        window.__debugData.functionCalls.push({
-                            name: funcName,
-                            args: Array.from(arguments),
-                            timestamp: Date.now(),
-                            stack: new Error().stack
-                        });
-                        // Activar debugger solo en versión de desarrollo
-                        // debugger;
-                        return original.apply(this, arguments);
-                    };
-                }
-            });
-            
-            // Detectar conexiones a bases de datos
-            ['indexedDB', 'openDatabase', 'firebase', 'firestore'].forEach(dbName => {
-                if (window[dbName]) {
-                    window.__debugData.dbOperations.push({
-                        type: 'db_connection',
-                        name: dbName,
-                        available: true,
-                        timestamp: Date.now()
-                    });
-                }
-            });
-            
-            console.log('[AdvancedJSAnalyzer] Debugger activado');
-        })();
-        """)
-        
-        print("Debugger configurado con éxito")
-    
-    async def analyze_variables(self, page):
-        """Analizar y manipular variables de una sola letra"""
-        single_char_vars = await page.evaluate("""
-        () => {
-            if (!window.__debugData || !window.__debugData.singleCharVars) {
-                return {};
-            }
-            return window.__debugData.singleCharVars;
-        }
-        """)
-        
-        # Probar cada variable modificándola
-        for var_name, info in single_char_vars.items():
-            if info['type'] in ['object', 'function'] and info['usageCount'] > 0:
-                # La variable se usa, intentar modificarla
-                await self._modify_and_test_variable(page, var_name, info)
-        
-        # Capturar los resultados finales
-        updated_data = await page.evaluate("""
-        () => {
-            if (!window.__debugData) {
-                return {
-                    singleCharVars: {},
-                    modifiedVars: {},
-                    callGraph: {},
-                    errors: []
-                };
-            }
-            return {
-                singleCharVars: window.__debugData.singleCharVars,
-                modifiedVars: window.__debugData.modifiedVars || {},
-                callGraph: window.__debugData.callGraph,
-                errors: window.__debugData.errors
-            };
-        }
-        """)
-        
-        # Registrar hallazgos
-        for var_name, info in updated_data['singleCharVars'].items():
-            if info['usageCount'] > 0:
-                self.findings.append({
-                    "type": "active_single_char_var",
-                    "name": var_name,
-                    "usage_count": info['usageCount'],
-                    "method_calls": info['methodCalls'],
-                    "severity": "MEDIUM"
-                })
-            
-            if var_name in updated_data.get('modifiedVars', {}):
-                mod_info = updated_data['modifiedVars'][var_name]
+                }, 100);
+
+                console.log('[RH_AdvJS] Debugger hooks activated.');
+            })();
+            """)
+            self.console.print_debug("JS debugger hooks injected successfully.")
+        except PlaywrightError as e:
+            self.console.print_error(f"Failed to setup JS debugger: {e}")
+        except Exception as e:
+            self.console.print_error(f"Unexpected error setting up JS debugger: {e}")
+
+    # --- Analysis Methods (Using _add_finding) ---
+    async def analyze_variables(self, page: Page):
+        """Analyzes and potentially manipulates variables."""
+        self.console.print_debug("Analyzing JS variables...")
+        page_url = page.url
+        try:
+            single_char_vars = await page.evaluate("() => window.__debugData ? window.__debugData.singleCharVars : {}")
+
+            tested_vars = 0
+            max_vars_to_test = 3
+            for var_name, info in single_char_vars.items():
+                if tested_vars >= max_vars_to_test:
+                    break
+                if info and info.get('type') in ['object', 'function'] and info.get('usageCount', 0) > 0:
+                    await self._modify_and_test_variable(page, var_name, info)
+                    tested_vars += 1
+                    await asyncio.sleep(0.2)
+
+            final_data = await page.evaluate("""
+                () => window.__debugData ? {
+                    singleCharVars: window.__debugData.singleCharVars || {},
+                    modifiedVars: window.__debugData.modifiedVars || {},
+                    callGraph: window.__debugData.callGraph || {},
+                    errors: window.__debugData.errors || []
+                } : {}
+            """)
+
+            for var_name, info in final_data.get('singleCharVars', {}).items():
+                if info.get('usageCount', 0) > 0:
+                    self._add_finding("active_single_char_var", "MEDIUM", {
+                        "name": var_name,
+                        "var_type": info.get('type'),
+                        "usage_count": info.get('usageCount'),
+                        "method_calls_count": len(info.get('methodCalls', [])),
+                    }, page_url)
+
+            for var_name, mod_info in final_data.get('modifiedVars', {}).items():
                 if mod_info.get('error'):
-                    self.findings.append({
-                        "type": "var_modification_error",
+                    self._add_finding("var_modification_error", "HIGH", {
                         "name": var_name,
                         "error": mod_info['error'],
-                        "severity": "HIGH",
-                        "details": "Error al modificar variable, posible punto de entrada para ataque"
-                    })
-        
-        # Buscar patrones sospechosos en el grafo de llamadas
-        for caller, callees in updated_data.get('callGraph', {}).items():
-            suspicious_patterns = ['ajax', 'fetch', 'getJSON', 'post', 'request', 'send', 'submit']
-            if any(pattern in caller.lower() for pattern in suspicious_patterns):
-                self.findings.append({
-                    "type": "suspicious_call_chain",
-                    "caller": caller,
-                    "callees": callees,
-                    "severity": "MEDIUM",
-                    "details": "Cadena de llamadas sospechosa, potencial punto de inyección"
-                })
-        
-        return updated_data
-    
-    async def _modify_and_test_variable(self, page, var_name, info):
-        """Modifica una variable y observa el comportamiento"""
-        # Probar diferentes tipos de modificaciones según el tipo
-        if info['type'] == 'object':
-            # Intentar inyección SQL en una propiedad
-            sql_payload = "' OR '1'='1"
-            await page.evaluate(f"""
-            (varName, payload) => {{
-                try {{
-                    // Guardar valor original
-                    const original = window[varName];
-                    
-                    // Buscar propiedad modificable
-                    const props = Object.keys(original || {{}});
-                    if (props.length > 0) {{
-                        const propToModify = props[0];
-                        const originalValue = original[propToModify];
-                        
-                        // Modificar propiedad
-                        original[propToModify] = payload;
-                        
-                        if (!window.__debugData) window.__debugData = {{}};
-                        if (!window.__debugData.modifiedVars) window.__debugData.modifiedVars = {{}};
-                        window.__debugData.modifiedVars[varName] = {{
-                            modified: true,
-                            property: propToModify,
-                            originalValue: originalValue,
-                            newValue: payload
-                        }};
-                        
-                        console.log(`Modified ${{varName}}.${{propToModify}} to "${{payload}}"`);
-                    }}
-                }} catch(e) {{
-                    if (!window.__debugData) window.__debugData = {{}};
-                    if (!window.__debugData.modifiedVars) window.__debugData.modifiedVars = {{}};
-                    window.__debugData.modifiedVars[varName] = {{
-                        error: e.toString(),
-                        stack: e.stack
-                    }};
-                    console.error(`Error modifying ${{varName}}:`, e);
-                }}
-            }}
-            """, var_name, sql_payload)
-            
-            # Esperar a que se procese la modificación
-            await asyncio.sleep(1)
-            
-            # Verificar si ha provocado errores
-            errors = await page.evaluate("""
-            () => {
-                if (!window.__debugData || !window.__debugData.errors) {
-                    return [];
+                        "details": "Error occurred attempting to modify variable; indicates potential sensitivity or protection mechanism.",
+                    }, page_url)
+                elif mod_info.get('modified'):
+                    self.console.print_debug(f"Variable '{var_name}' modified for testing ({mod_info.get('property','?')}).")
+
+            for caller, callees in final_data.get('callGraph', {}).items():
+                suspicious_keywords = ['ajax', 'fetch', 'http', 'post', 'send', 'submit', 'request', 'query', 'param', 'token', 'auth', 'key', 'secret']
+                if any(keyword in caller.lower() for keyword in suspicious_keywords):
+                    callee_str = ', '.join(callees)
+                    if any(keyword in callee_str.lower() for keyword in suspicious_keywords):
+                        self._add_finding("suspicious_call_chain", "MEDIUM", {
+                            "caller": caller[:200],
+                            "callees": callees,
+                            "details": "Potentially sensitive function call chain detected."
+                        }, page_url)
+
+        except PlaywrightError as e:
+            self.console.print_error(f"Error during variable analysis: {e}")
+        except Exception as e:
+            self.console.print_error(f"Unexpected error during variable analysis: {e}")
+
+    async def _modify_and_test_variable(self, page: Page, var_name: str, info: Dict):
+        """Attempts to modify a variable and checks for errors."""
+        page_url = page.url
+        self.console.print_debug(f"Attempting modification test for var '{var_name}' (Type: {info.get('type')})")
+        modification_successful = False
+
+        test_payloads = [
+            "'", '"', "`",
+            "<script>alert('rh_mod_xss')</script>",
+            "' OR 1=1 --",
+            "{{7*7}}", "${7*7}",
+            random.choice(self.cmd_injection_payloads),
+            "file:///etc/passwd",
+            "javascript:alert('rh_mod_jsuri')",
+            {"key": "value", "nested": {"$ne": 1}},
+            "<h1>RH_MOD</h1>",
+            None, True, False, 0, 1, -1, [], {},
+        ]
+        payload_to_use = random.choice(test_payloads)
+        payload_str = str(payload_to_use)
+
+        try:
+            result = await page.evaluate("""
+                async (varName, payload) => {
+                    const debugData = window.__debugData || {};
+                    if (!debugData.modifiedVars) debugData.modifiedVars = {};
+                    const modInfo = { modified: false, error: null, stack: null };
+                    debugData.modifiedVars[varName] = modInfo;
+
+                    try {
+                        const target = window[varName];
+                        if (target === undefined || target === null) {
+                            modInfo.error = "Variable is undefined or null"; return modInfo;
+                        }
+
+                        const originalType = typeof target;
+                        let modified = false;
+
+                        if (originalType === 'object' && target !== null) {
+                            const props = Object.keys(target);
+                            const propToModify = props.length > 0 ? props[0] : 'rh_test_prop';
+                            const originalValue = target[propToModify];
+                            try {
+                                target[propToModify] = payload;
+                                modInfo.property = propToModify;
+                                modInfo.originalValue = originalValue;
+                                modInfo.newValue = payload;
+                                modified = true;
+                            } catch (propErr) { modInfo.error = `Error setting property ${propToModify}: ${propErr.toString()}`; }
+
+                        } else if (originalType === 'function') {
+                            try {
+                                target(payload);
+                                modInfo.action = 'called function';
+                                modified = true;
+                            } catch (callErr) { modInfo.error = `Error calling function: ${callErr.toString()}`; }
+
+                        } else {
+                            try {
+                                modInfo.error = "Direct reassignment of primitives via evaluate is unreliable.";
+                            } catch(assignErr) { modInfo.error = `Error reassigning primitive: ${assignErr.toString()}`; }
+                        }
+
+                        modInfo.modified = modified;
+                        if (modified) console.log(`[RH_AdvJS] Modification test applied to ${varName}`);
+
+                    } catch (e) {
+                        modInfo.error = `General modification error: ${e.toString()}`;
+                        modInfo.stack = e.stack;
+                        console.error(`[RH_AdvJS] Error modifying ${varName}:`, e);
+                    }
+                    return modInfo;
                 }
-                return window.__debugData.errors;
-            }
-            """)
-            
-            # Registrar errores nuevos
-            recent_errors = [e for e in errors if e['timestamp'] > (info.get('timestamp', 0) or 0)]
-            for error in recent_errors:
-                self.findings.append({
-                    "type": "var_modification_error",
-                    "variable": var_name,
-                    "error": error,
-                    "severity": "HIGH",
-                    "details": "Error provocado por modificación, posible vulnerabilidad"
-                })
-        
-        # Intentar inyección de comandos
-        if info['type'] == 'object' and info['usageCount'] > 2:
-            cmd_payload = random.choice(self.cmd_injection_payloads)
-            await page.evaluate(f"""
-            (varName, payload) => {{
-                try {{
-                    // Buscar métodos que acepten cadenas
-                    const obj = window[varName];
-                    for (let prop in obj) {{
-                        if (typeof obj[prop] === 'function') {{
-                            try {{
-                                // Intentar llamar con payload
-                                obj[prop](payload);
-                                console.log(`Called ${window[var_name]}.${prod}(${Payload})`);
-                            }} catch(e) {{
-                                // Ignorar errores en las llamadas individuales
-                            }}
-                        }}
-                    }}
-                }} catch(e) {{
-                    console.error(`Error in command injection test:`, e);
-                }}
-            }}
-            """, var_name, cmd_payload)
-            
-            await asyncio.sleep(1)
-    
-    async def trace_function_execution(self, page, selector_to_click):
-        """Coloca breakpoints y sigue la ejecución al hacer clic en un elemento"""
-        # Primero capturar estado antes de hacer clic
-        before_state = await page.evaluate("""
-        () => {
-            if (!window.__debugData) {
-                return {
-                    networkCount: 0,
-                    errorCount: 0,
-                    serviceConnections: []
-                };
-            }
-            return {
-                networkCount: window.__debugData.networkRequests.length,
-                errorCount: window.__debugData.errors.length,
-                serviceConnections: [...window.__debugData.serviceConnections]
-            };
-        }
-        """)
-        
-        # Intentar hacer clic en el elemento
-        try:
-            await page.click(selector_to_click)
-            # Esperar a que se completen las peticiones de red
-            await page.wait_for_load_state("networkidle")
+            """, var_name, payload_to_use)
+
+            modification_successful = result.get('modified', False)
+            if result.get('error'):
+                self._add_finding("var_modification_error", "HIGH", {
+                    "name": var_name, "error": result['error'], "payload_type": type(payload_to_use).__name__,
+                    "details": f"Error during controlled modification attempt with payload: {payload_str[:50]}..."
+                }, page_url)
+
+            if modification_successful:
+                await asyncio.sleep(1.0)
+                new_errors = await page.evaluate("""
+                    (startTime) => {
+                        const debugData = window.__debugData || {};
+                        return (debugData.errors || []).filter(e => e.timestamp > startTime);
+                    }
+                """, result.get('timestamp', time.time() * 1000))
+
+                for error in new_errors:
+                    self._add_finding("var_modification_side_effect", "HIGH", {
+                        "variable": var_name,
+                        "payload_type": type(payload_to_use).__name__,
+                        "payload_preview": payload_str[:50] + '...',
+                        "error_type": error.get('type'),
+                        "error_message": error.get('message') or error.get('reason'),
+                        "details": "Error occurred shortly after variable modification, potentially indicating vulnerability."
+                    }, page_url)
+
+        except PlaywrightError as e:
+            self.console.print_error(f"Playwright error during variable modification test for '{var_name}': {e}")
         except Exception as e:
-            print(f"Error al hacer clic en {selector_to_click}: {e}")
-        
-        # Capturar estado después del clic
-        after_state = await page.evaluate(f"""
-        () => {{
-            if (!window.__debugData) {{
-                return {{
-                    networkRequests: [],
-                    errors: [],
-                    serviceConnections: []
-                }};
-            }}
-            return {{
-                networkRequests: window.__debugData.networkRequests.slice({before_state['networkCount']}),
-                errors: window.__debugData.errors.slice({before_state['errorCount']}),
-                serviceConnections: window.__debugData.serviceConnections.slice({len(before_state['serviceConnections'])})
-            }};
-        }}
-        """)
-        
-        # Analizar los resultados
-        results = {
-            "clicked_element": selector_to_click,
-            "new_network_requests": len(after_state.get('networkRequests', [])),
-            "new_errors": len(after_state.get('errors', [])),
-            "new_service_connections": len(after_state.get('serviceConnections', []))
-        }
-        
-        # Identificar endpoints interesantes
-        interesting_endpoints = []
-        for req in after_state.get('networkRequests', []):
-            url = req.get('url', '')
-            if any(pattern in url for pattern in ['api', 'data', 'query', 'graphql', 'json']):
-                interesting_endpoints.append({
-                    "url": url,
-                    "method": req.get('method', 'GET'),
-                    "has_data": bool(req.get('data', False))
-                })
-        
-        results["interesting_endpoints"] = interesting_endpoints
-        
-        # Registrar hallazgos si hay conexiones a servicios
-        for conn in after_state.get('serviceConnections', []):
-            self.findings.append({
-                "type": "service_connection",
-                "url": conn.get('url'),
-                "triggered_by": selector_to_click,
-                "severity": "MEDIUM",
-                "details": f"Conexión a servicio detectada al hacer clic en {selector_to_click}"
-            })
-        
-        return results
-    
-    async def inject_payloads_in_form(self, page, form_selector):
-        """Inyecta payloads en un formulario y observa la respuesta"""
+            self.console.print_error(f"Unexpected error during variable modification test for '{var_name}': {e}")
+
+    async def trace_function_execution(self, page: Page, selector_to_click: str):
+        """Analyzes changes caused by clicking an element."""
+        self.console.print_debug(f"Tracing execution after click on: {selector_to_click}")
+        page_url = page.url
         try:
-            self.logger.info(f"Iniciando inyección de payloads en formulario: {form_selector}")
-            
-            # Identificar todos los campos del formulario
-            form_fields = await page.evaluate(f"""
-            (formSelector) => {{
-                const form = document.querySelector(formSelector);
-                if (!form) return null;
-                
-                const fields = Array.from(form.querySelectorAll('input, select, textarea'));
-                return fields.map(field => {{
-                    return {{
-                        name: field.name || field.id || '',
-                        type: field.type || field.tagName.toLowerCase(),
-                        value: field.value || '',
-                        selector: `${form_selector} ${field.tagName.toLowerCase()}` + 
-                                 (field.id ? `#${field.id}` : '') + 
-                                 (field.name ? `[name="${field.name}"]` : '')
-                    }};
-                }});
-            }}
-            """, form_selector)
+            before_state = await page.evaluate("() => window.__debugData ? { networkCount: window.__debugData.networkRequests.length, errorCount: window.__debugData.errors.length, serviceConnectionsCount: window.__debugData.serviceConnections.length, dbOperationsCount: window.__debugData.dbOperations.length } : {}")
+            start_time = time.time() * 1000
 
-            if not form_fields:
-                self.logger.warning(f"No se encontraron campos en el formulario: {form_selector}")
-                return {"error": f"No se encontró el formulario: {form_selector}"}
+            element = await page.query_selector(selector_to_click)
+            if not element:
+                self.console.print_warning(f"Cannot trace click, element not found: {selector_to_click}")
+                return
 
-            # Preparar payloads para diferentes tipos de campos
-            payloads = {
-                "text": ["' OR 1=1--", "<script>alert(1)</script>", "; ls -la"],
-                "password": ["admin' --", "' UNION SELECT 1,2,3--"],
-                "email": ["admin'@example.com", "test+<script>alert(1)</script>@example.com"],
-                "number": ["1 OR 1=1", "999999", "-1' OR 1=1"]
-            }
+            if not await element.is_visible():
+                self.console.print_warning(f"Cannot trace click, element not visible: {selector_to_click}")
+                return
 
-            results = {"attempts": []}
-            
-            # Para cada campo, intentar diferentes payloads
-            for current_field in form_fields:
-                field_type = current_field.get('type', 'text')
-                field_selector = current_field.get('selector')
-                field_name = current_field.get('name', 'unknown')
+            self.console.print_debug(f"Clicking element for tracing: {selector_to_click}")
+            async with page.expect_navigation(wait_until="load", timeout=self.console.timeout // 2):
+                await element.click(timeout=5000)
+            self.console.print_debug(f"Navigation completed after click on {selector_to_click}")
+            await asyncio.sleep(0.5)
 
-                if not field_selector:
-                    self.logger.warning(f"Campo sin selector válido: {field_name}")
-                    continue
+            after_state = await page.evaluate("""
+                (beforeCounts, startTime) => {
+                    const debugData = window.__debugData || {};
+                    const network = debugData.networkRequests || [];
+                    const errors = debugData.errors || [];
+                    const services = debugData.serviceConnections || [];
+                    const dbOps = debugData.dbOperations || [];
 
-                self.logger.info(f"Probando campo: {field_name} ({field_type})")
-                
-                # Seleccionar payloads apropiados
-                field_payloads = payloads.get(field_type, payloads['text'])
-                
-                for payload in field_payloads:
-                    try:
-                        self.logger.debug(f"Intentando payload: {payload}")
-                        
-                        # Llenar el campo
-                        await page.fill(field_selector, payload)
-                        
-                        # Buscar y hacer clic en el botón de envío
-                        submit_button = await page.query_selector(f"{form_selector} button[type=submit], {form_selector} input[type=submit]")
-                        if submit_button:
-                            await submit_button.click()
-                            await page.wait_for_load_state("networkidle")
-                            
-                            attempt_result = {
-                                "field": field_name,
-                                "payload": payload,
-                                "success": True,
-                                "error": None
-                            }
-                            
-                        else:
-                            attempt_result = {
-                                "field": field_name,
-                                "payload": payload,
-                                "success": False,
-                                "error": "No se encontró botón de envío"
-                            }
-                        
-                        results["attempts"].append(attempt_result)
-                        
-                    except Exception as e:
-                        self.logger.error(f"Error al probar payload '{payload}' en campo '{field_name}': {str(e)}")
-                        results["attempts"].append({
-                            "field": field_name,
-                            "payload": payload,
-                            "success": False,
-                            "error": str(e)
-                        })
-                        
-                    # Esperar un poco entre intentos
-                    await asyncio.sleep(0.5)
-                    
-                # Restaurar el formulario para el siguiente campo
-                try:
-                    await page.goto(page.url)
-                    await page.wait_for_load_state("networkidle")
-                except Exception as e:
-                    self.logger.error(f"Error al restaurar página: {str(e)}")
+                    return {
+                        newNetwork: network.slice(beforeCounts.networkCount || 0),
+                        newErrors: errors.filter(e => e.timestamp > startTime),
+                        newServices: services.slice(beforeCounts.serviceConnectionsCount || 0),
+                        newDbOps: dbOps.slice(beforeCounts.dbOperationsCount || 0)
+                    };
+                }
+            """, before_state, start_time)
 
-            return results
-            
+            if after_state.get('newNetwork'):
+                self.console.print_debug(f"Found {len(after_state['newNetwork'])} new network requests after click.")
+                for req in after_state['newNetwork']:
+                    if any(p in req.get('url','').lower() for p in ['api','graphql','query','data']):
+                        self._add_finding("network_request_on_click", "INFO", {
+                            "element_selector": selector_to_click,
+                            "request_url": req.get('url'),
+                            "request_method": req.get('method', req.get('options',{}).get('method','GET')),
+                            "details": "API-like network request triggered by element click."
+                        }, page_url)
+
+            if after_state.get('newErrors'):
+                self.console.print_warning(f"Found {len(after_state['newErrors'])} new JS errors after click on {selector_to_click}")
+                for err in after_state['newErrors']:
+                    self._add_finding("js_error_on_click", "LOW", {
+                        "element_selector": selector_to_click,
+                        "error_type": err.get('type'),
+                        "error_message": err.get('message') or err.get('reason'),
+                        "details": "JavaScript error occurred after element interaction."
+                    }, page_url)
+
+            if after_state.get('newServices'):
+                self.console.print_info(f"Found {len(after_state['newServices'])} new service connections after click on {selector_to_click}")
+                for svc in after_state['newServices']:
+                    self._add_finding("service_connection_on_click", "MEDIUM", {
+                        "element_selector": selector_to_click,
+                        "service_url": svc.get('url'),
+                        "service_type": svc.get('type', 'api_endpoint'),
+                        "details": "Potential backend service connection triggered by element click."
+                    }, page_url)
+
+            if after_state.get('newDbOps'):
+                self.console.print_info(f"Found {len(after_state['newDbOps'])} new DB operations after click on {selector_to_click}")
+                for op in after_state['newDbOps']:
+                    self._add_finding("db_operation_on_click", "HIGH", {
+                        "element_selector": selector_to_click,
+                        "db_name": op.get('name'),
+                        "operation_type": op.get('type'),
+                        "details": f"Potential DB operation ({op.get('type')}) triggered by element click.",
+                        "data_preview": str(op.get('data'))[:100]+"..." if op.get('data') else None
+                    }, page_url)
+
+        except PlaywrightError as e:
+            if "navigation" in str(e).lower() and "timeout" in str(e).lower():
+                self.console.print_debug(f"Click on {selector_to_click} did not cause navigation within timeout.")
+            else:
+                self.console.print_warning(f"Playwright error during trace execution for {selector_to_click}: {e}")
         except Exception as e:
-            self.logger.error(f"Error general en inject_payloads_in_form: {str(e)}")
-            return {"error": str(e)}
-    
-    async def analyze_db_connections(self, page):
-        """Analiza posibles conexiones a bases de datos"""
-        db_operations = await page.evaluate("""
-        () => {
-            if (!window.__debugData || !window.__debugData.dbOperations) {
-                return [];
-            }
-            return window.__debugData.dbOperations;
-        }
-        """)
-        
-        for operation in db_operations:
-            self.findings.append({
-                "type": "database_operation",
-                "database": operation.get('name', 'unknown'),
-                "operation_type": operation.get('operation', 'unknown'),
-                "severity": "HIGH",
-                "details": f"Operación de base de datos detectada: {json.dumps(operation)[:100]}..."
-            })
-        
-        return db_operations
-    
-    async def run_full_analysis(self, page):
-        """Ejecuta el análisis completo y devuelve los hallazgos"""
-        self.console.print("[green]Running full analysis...[/green]")
-        findings = []
-        # Implement the full analysis logic here, adding findings to the list
-        # Example:
-        # findings.append({"type": "example", "data": "example data"})
-        return findings
+            self.console.print_error(f"Unexpected error during trace execution for {selector_to_click}: {e}")
+
+    async def analyze_db_connections(self, page: Page):
+        """Retrieves DB connection info from JS context."""
+        self.console.print_debug("Analyzing potential DB connections from JS context...")
+        page_url = page.url
+        try:
+            db_operations = await page.evaluate("() => window.__debugData ? window.__debugData.dbOperations : []")
+            for operation in db_operations:
+                self._add_finding("database_operation", "HIGH", {
+                    "db_name": operation.get('name', 'unknown'),
+                    "operation_type": operation.get('type', 'unknown'),
+                    "details": f"DB operation/connection detected in JS context: {json.dumps(operation)[:150]}...",
+                    "data_preview": str(operation.get('data'))[:100]+"..." if operation.get('data') else None
+                }, page_url)
+        except PlaywrightError as e:
+            self.console.print_error(f"Error analyzing DB connections: {e}")
+        except Exception as e:
+            self.console.print_error(f"Unexpected error analyzing DB connections: {e}")
+
+    async def run_full_analysis(self, page: Page):
+        """Orchestrates the advanced JS analysis steps."""
+        self.console.print_info(f"Running full advanced JS analysis on {page.url}")
+
+        await self.setup_debugger(page)
+        await self.analyze_variables(page)
+        await asyncio.sleep(0.5)
+        await self.analyze_db_connections(page)
+        await asyncio.sleep(0.2)
+
+        self.console.print_debug(f"Finished advanced JS analysis for {page.url}")

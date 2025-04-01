@@ -2,6 +2,7 @@ import asyncio
 from typing import List, Dict, Any
 import json
 import random
+from console_manager import ConsoleManager
 from smart_detector import SmartDetector
 import threading
 import subprocess
@@ -10,9 +11,20 @@ import sys
 from datetime import datetime
 import shutil
 
+class SmartDetector:
+    def __init__(self, console_manager: ConsoleManager): # Add console_manager
+        self.console = console_manager
+        self.console.print_debug("Smart Detector Initialized")
+
 class AttackEngine:
-    def __init__(self):
-        self.detector = SmartDetector()
+    def __init__(self, console_manager: ConsoleManager, interactsh_url: str = None): # Add interactsh_url
+        self.console = console_manager
+        self.detector = SmartDetector(console_manager=console_manager) # Pass console_manager
+        self.console.print_debug("Attack Engine Initialized")
+        self.interactsh_url = interactsh_url # Store interactsh_url
+        # Validation happens inside AttackEngine, just log what was provided
+        if interactsh_url:
+            self.console.print_info(f"Interactsh URL provided: {interactsh_url}")
         self.payloads = {
             "sql_injection": [
                 "' OR '1'='1",
@@ -723,3 +735,5 @@ class AttackEngine:
                 "bypass_details": result.get("details", "")
             })
         return findings
+
+
